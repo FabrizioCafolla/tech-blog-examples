@@ -2,7 +2,10 @@ BUILDKIT_HOST_NAME := buildkitd
 export BUILDKIT_HOST := docker-container://$(BUILDKIT_HOST_NAME)
 
 CONTEXT := app
+IMAGE_FOLDER := .images/
+DOCKERFILE := Dockerfile
 CACHE_FOLDER := .cache/$(CONTEXT)
+CACHE_CLEAN := true
 
 .check:
 	@if [ "$(CONTEXT)" == "" ]; then \
@@ -12,7 +15,7 @@ CACHE_FOLDER := .cache/$(CONTEXT)
 	@if [[ "$(BUILDKIT_HOST)" != docker-container* ]]; then \
         echo "BuildKit deamon start outside"; \
 	else \
-		$(MAKE) start-buildkit-deamon ; \
+		$(MAKE) buildkit-start-deamon ; \
 	fi
 	@echo "BuildKit daemon is running on $(BUILDKIT_HOST)"
 
@@ -29,23 +32,32 @@ CACHE_FOLDER := .cache/$(CONTEXT)
 	done
 	@echo "Extracted cache to $(CACHE_FOLDER)/$(CACHE_TYPE)-extracted\n\n"
 
-.build-ctl: .check clean
-	@rm -Rf $(CACHE_FOLDER)/$(CACHE_TYPE)
+.buildctl: .check clean
+	@rm $(CACHE_FOLDER)/cache-metrics-$(CACHE_TYPE).json
+	@rm $(CACHE_FOLDER)/trace-$(CACHE_TYPE).json
 	@time buildctl build \
   		--frontend dockerfile.v0 \
 		--local context=$(CONTEXT) \
     	--local dockerfile=./$(CONTEXT) \
+		--opt filename=$(DOCKERFILE) \
 		--opt build-arg:LABEL_TEST=test \
-		--export-cache type=local,oci-mediatypes=true,image-manifest=true,dest=$(CACHE_FOLDER)/$(CACHE_TYPE),mode=$(CACHE_TYPE),compression=gzip \
+		--export-cache type=local,oci-mediatypes=true,image-manifest=true,dest=$(CACHE_FOLDER)/$(CACHE_TYPE),mode=$(CACHE_TYPE),compression=zstd,compression-level=3 \
 		--import-cache type=local,src=$(CACHE_FOLDER)/$(CACHE_TYPE) \
-		--output type=image,name=$(CONTEXT) \
-		--opt attest:sbom= \
-		--trace trace.tmp.json \
-		--debug-json-cache-metrics cache-metrics.json
-	@jq -s '.' trace.tmp.json > $(CACHE_FOLDER)/$(CACHE_TYPE)/trace.json ; rm trace.tmp.json
-	@mv cache-metrics.json $(CACHE_FOLDER)/$(CACHE_TYPE)/cache-metrics.json
+		--output type=oci,name=$(CONTEXT):$(CACHE_TYPE),dest=$(IMAGE_FOLDER)$(CONTEXT)-$(CACHE_TYPE).tar \
+		--trace $(CACHE_FOLDER)/trace-$(CACHE_TYPE).json \
+		--debug-json-cache-metrics $(CACHE_FOLDER)/cache-metrics-$(CACHE_TYPE).json
 
-start-buildkit-deamon:
+.load-image:
+	@if [ "$(CACHE_TYPE)" == "" ]; then \
+		echo "Invalid cache type"; \
+	fi
+	@echo "Loading image $(CONTEXT)-$(CACHE_TYPE).tar"
+	@docker load -i $(IMAGE_FOLDER)$(CONTEXT)-$(CACHE_TYPE).tar
+
+create-test-file:
+	@dd if=/dev/urandom of=$(CONTEXT)/test-file bs=1G count=1
+
+buildkit-start-deamon:
 	@if [[ "$$(docker ps -f name=$(BUILDKIT_HOST_NAME) -q)" == "" ]]; then \
 		echo "BuildKit daemon start docker container"; \
 		docker run -d --name $(BUILDKIT_HOST_NAME) --privileged moby/buildkit:latest || docker rm -f $(BUILDKIT_HOST_NAME); \
@@ -53,18 +65,37 @@ start-buildkit-deamon:
 		echo "BuildKit daemon container is already running."; \
 	fi
 
+buildkit-down-deamon:
+	@if [[ "$$(docker ps -f name=$(BUILDKIT_HOST_NAME) -q)" != "" ]]; then \
+		echo "Stopping BuildKit daemon"; \
+		docker stop $(BUILDKIT_HOST_NAME); \
+		docker rm $(BUILDKIT_HOST_NAME); \
+	else \
+		echo "BuildKit daemon container is not running."; \
+	fi
+
 clean:
-	@echo "Cleaning cache"
-	@buildctl prune --all
-	@buildctl du
+	@if [ "$(CACHE_CLEAN)" == "true" ]; then \
+		echo "Cleaning cache"; \
+		rm -Rf $(CACHE_FOLDER)/$(CACHE_TYPE); \
+		buildctl prune --all; \
+		buildctl du; \
+		make create-test-file; \
+	fi
 
 build-max:
-	@$(MAKE) .build-ctl CACHE_TYPE=max
+	@$(MAKE) .buildctl CACHE_TYPE=max
 
 build-min:
-	@$(MAKE) .build-ctl CACHE_TYPE=min
+	@$(MAKE) .buildctl CACHE_TYPE=min
 
-compare-cache: .check extract-cache-min extract-cache-max
+load-image-min:
+	@$(MAKE) .load-image CACHE_TYPE=min
+
+load-image-max:
+	@$(MAKE) .load-image CACHE_TYPE=max
+
+cache-compare: .check cache-extract-min cache-extract-max
 	@echo "Comparing max and min cache modes"
 	@echo "Size of max cache:"
 	@du -sh $(CACHE_FOLDER)/max-extracted
@@ -76,8 +107,12 @@ compare-cache: .check extract-cache-min extract-cache-max
 	@find .cache/app/max-extracted -type f -name "test-file"
 	@find .cache/app/min-extracted -type f -name "test-file"
 
-extract-cache-min:
+cache-extract-min:
 	@$(MAKE) .extract-cache CACHE_TYPE=min
 
-extract-cache-max:
+cache-extract-max:
 	@$(MAKE) .extract-cache CACHE_TYPE=max
+
+init: clean buildkit-start-deamon
+	@mkdir -p $(CACHE_FOLDER)
+	@mkdir -p $(IMAGE_FOLDER)

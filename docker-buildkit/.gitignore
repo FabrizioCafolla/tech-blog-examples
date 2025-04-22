@@ -1,2 +1,4 @@
 .cache
+.images
 *.json
+app/test-file
